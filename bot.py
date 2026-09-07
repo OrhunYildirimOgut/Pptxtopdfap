@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+  #!/usr/bin/env python3
 """
 PPTX -> PDF Telegram Botu
 --------------------------
@@ -24,11 +24,13 @@ Kurulum:
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import uuid
 
+import gdown
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -48,6 +50,9 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 MAX_FILE_SIZE_MB = 50          # Telegram bot API indirme limiti ~20MB (local API server ile artırılabilir)
 SOFFICE_TIMEOUT_SEC = 180       # Büyük dosyalar için dönüştürme zaman aşımı
 ALLOWED_EXTENSIONS = (".pptx", ".ppt", ".potx", ".pptm")
+
+# Google Drive dosya/paylaşım linklerini yakalamak için desen
+DRIVE_URL_PATTERN = re.compile(r"https?://(drive|docs)\.google\.com/\S+", re.IGNORECASE)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -144,7 +149,8 @@ def convert_pptx_to_pdf(input_path: str, output_dir: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Merhaba! 👋\n\n"
-        "Bana bir *.pptx* (PowerPoint) dosyası gönder, "
+        "Bana bir *.pptx* (PowerPoint) dosyası gönder ya da "
+        "halka açık bir *Google Drive* linki paylaş, "
         "sana görsel ve metin kalitesi bozulmadan *PDF* olarak geri göndereyim.\n\n"
         "Not: Dönüştürme LibreOffice ile yapıldığı için orijinal fontlar, "
         "görseller ve düzen olabildiğince korunur.",
@@ -161,40 +167,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    document = update.message.document
-    if document is None:
-        return
-
-    file_name = document.file_name or "sunum.pptx"
-    ext = os.path.splitext(file_name)[1].lower()
-
-    if ext not in ALLOWED_EXTENSIONS:
-        await update.message.reply_text(
-            "⚠️ Lütfen bir PowerPoint dosyası gönder (.pptx / .ppt / .pptm / .potx)."
-        )
-        return
-
-    size_mb = document.file_size / (1024 * 1024) if document.file_size else 0
-    if size_mb > MAX_FILE_SIZE_MB:
-        await update.message.reply_text(
-            f"⚠️ Dosya çok büyük ({size_mb:.1f} MB). "
-            f"Maksimum {MAX_FILE_SIZE_MB} MB destekleniyor."
-        )
-        return
-
-    status_msg = await update.message.reply_text("📥 Dosya indiriliyor...")
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT
-    )
-
-    work_dir = tempfile.mkdtemp(prefix=f"pptx2pdf_{uuid.uuid4().hex}_")
+async def convert_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    input_path: str,
+    work_dir: str,
+    status_msg,
+) -> None:
+    """
+    Verilen pptx dosyasını PDF'e çevirip kullanıcıya geri gönderir.
+    Hem Telegram'a doğrudan yüklenen dosyalar hem de Drive'dan indirilen
+    dosyalar için ortak dönüştürme/yanıtlama mantığı burada.
+    """
+    file_name = os.path.basename(input_path)
     try:
-        input_path = os.path.join(work_dir, file_name)
-
-        tg_file = await context.bot.get_file(document.file_id)
-        await tg_file.download_to_drive(custom_path=input_path)
-
         await status_msg.edit_text("🔄 PDF'e dönüştürülüyor... (biraz sürebilir)")
 
         loop = asyncio.get_running_loop()
@@ -229,10 +215,130 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    document = update.message.document
+    if document is None:
+        return
+
+    file_name = document.file_name or "sunum.pptx"
+    ext = os.path.splitext(file_name)[1].lower()
+
+    if ext not in ALLOWED_EXTENSIONS:
+        await update.message.reply_text(
+            "⚠️ Lütfen bir PowerPoint dosyası gönder (.pptx / .ppt / .pptm / .potx)."
+        )
+        return
+
+    size_mb = document.file_size / (1024 * 1024) if document.file_size else 0
+    if size_mb > MAX_FILE_SIZE_MB:
+        await update.message.reply_text(
+            f"⚠️ Dosya çok büyük ({size_mb:.1f} MB). "
+            f"Maksimum {MAX_FILE_SIZE_MB} MB destekleniyor."
+        )
+        return
+
+    status_msg = await update.message.reply_text("📥 Dosya indiriliyor...")
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT
+    )
+
+    work_dir = tempfile.mkdtemp(prefix=f"pptx2pdf_{uuid.uuid4().hex}_")
+    input_path = os.path.join(work_dir, file_name)
+
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        await tg_file.download_to_drive(custom_path=input_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Telegram dosyası indirilirken hata oluştu")
+        await status_msg.edit_text(f"❌ Dosya indirilemedi:\n{exc}")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return
+
+    await convert_and_reply(update, context, input_path, work_dir, status_msg)
+
+
+def download_from_drive(drive_url: str, work_dir: str) -> str:
+    """
+    Bir Google Drive paylaşım linkinden dosyayı indirir.
+    gdown, Drive'ın büyük dosyalarda gösterdiği 'virüs taraması
+    yapılamadı' onay adımını otomatik atlar ve orijinal dosya adını
+    (uzantısıyla birlikte) content-disposition başlığından alır.
+
+    Not: Dosyanın Drive'da "Bağlantıya sahip olan herkes görüntüleyebilir"
+    şeklinde paylaşılmış olması gerekir.
+    """
+    output_path = gdown.download(
+        url=drive_url,
+        output=work_dir + os.sep,   # sondaki ayraç: orijinal dosya adını kullan
+        quiet=True,
+        fuzzy=True,                  # farklı Drive link formatlarını tanır
+    )
+
+    if not output_path or not os.path.exists(output_path):
+        raise RuntimeError(
+            "Drive dosyası indirilemedi. Linkin doğru olduğundan ve "
+            "dosyanın 'Bağlantıya sahip olan herkes görüntüleyebilir' "
+            "şeklinde paylaşıldığından emin ol."
+        )
+
+    return output_path
+
+
+async def handle_drive_link(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, drive_url: str
+) -> None:
+    status_msg = await update.message.reply_text("🔗 Drive linki alındı, indiriliyor...")
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT
+    )
+
+    work_dir = tempfile.mkdtemp(prefix=f"pptx2pdf_drive_{uuid.uuid4().hex}_")
+
+    try:
+        loop = asyncio.get_running_loop()
+        input_path = await loop.run_in_executor(
+            None, download_from_drive, drive_url, work_dir
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Drive indirme hatası")
+        await status_msg.edit_text(f"❌ {exc}")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        await status_msg.edit_text(
+            "⚠️ Drive'daki dosya bir PowerPoint dosyası değil gibi görünüyor "
+            f"(bulunan uzantı: {ext or 'yok'}). Lütfen .pptx dosyasına link ver."
+        )
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return
+
+    size_mb = os.path.getsize(input_path) / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        await status_msg.edit_text(
+            f"⚠️ Dosya çok büyük ({size_mb:.1f} MB). "
+            f"Maksimum {MAX_FILE_SIZE_MB} MB destekleniyor."
+        )
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return
+
+    await convert_and_reply(update, context, input_path, work_dir, status_msg)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text or ""
+    match = DRIVE_URL_PATTERN.search(text)
+    if match:
+        await handle_drive_link(update, context, match.group(0))
+        return
+    await handle_wrong_type(update, context)
+
+
 async def handle_wrong_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Lütfen bana bir *.pptx dosyası* gönder (dosya/document olarak, "
-        "fotoğraf ya da metin olarak değil).",
+        "Lütfen bana bir *.pptx dosyası* gönder (dosya/document olarak) "
+        "ya da halka açık bir Google Drive linki paylaş.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -258,10 +364,10 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND | filters.PHOTO | filters.VIDEO,
-            handle_wrong_type,
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.VIDEO, handle_wrong_type)
     )
     application.add_error_handler(error_handler)
 
@@ -276,3 +382,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
