@@ -12,7 +12,8 @@ RUN apt-get update && \
         fonts-crosextra-caladea && \
     rm -rf /var/lib/apt/lists/*
 
-RUN echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections && \
+RUN sed -i 's/Components: main/Components: main contrib/' /etc/apt/sources.list.d/debian.sources && \
+    echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections && \
     apt-get update && \
     apt-get install -y --no-install-recommends ttf-mscorefonts-installer && \
     rm -rf /var/lib/apt/lists/*
