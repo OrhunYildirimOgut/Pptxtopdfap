@@ -25,6 +25,6 @@ WORKDIR /app
 COPY requirements-4.txt .
 RUN pip install --no-cache-dir -r requirements-4.txt
 
-COPY bot-2.py .
+COPY bot-3.py .
 
-CMD ["python", "bot-2.py"]
+CMD ["python", "bot-3.py"]
