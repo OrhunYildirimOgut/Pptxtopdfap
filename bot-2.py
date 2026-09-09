@@ -776,7 +776,7 @@ def download_from_drive(drive_url: str, work_dir: str) -> str:
         url=drive_url,
         output=work_dir + os.sep,   # sondaki ayraç: orijinal dosya adını kullan
         quiet=True,
-                        
+       )                
   if not output_path or not os.path.exists(output_path):
         raise RuntimeError(
             "Drive dosyası indirilemedi. Linkin doğru olduğundan ve "
