@@ -22,9 +22,9 @@ RUN fc-cache -f -v
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-4.txt .
+RUN pip install --no-cache-dir -r requirements-4.txt
 
-COPY bot-1.py .
+COPY bot-2.py .
 
-CMD ["python", "bot-1.py"]
+CMD ["python", "bot-2.py"]
