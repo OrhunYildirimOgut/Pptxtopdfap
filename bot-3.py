@@ -806,24 +806,46 @@ def download_from_drive(drive_url: str, work_dir: str) -> str:
         if not file_id:
             raise RuntimeError("Google Slides linkinden dosya kimliği okunamadı.")
 
+        # 1. Deneme: "export" adresi (dosya gerçekten native Google Slides
+        #    formatındaysa bunu pptx'e dönüştürerek indirir).
         export_url = f"https://docs.google.com/presentation/d/{file_id}/export/pptx"
         resp = requests.get(export_url, timeout=60)
-
         content_type = resp.headers.get("Content-Type", "")
         is_valid_pptx = resp.status_code == 200 and (
             "presentationml" in content_type or resp.content[:2] == b"PK"
         )
-        if not is_valid_pptx:
-            raise RuntimeError(
-                "Google Slides dosyası indirilemedi. Dosyanın 'Bağlantıya "
-                "sahip olan herkes görüntüleyebilir' şeklinde paylaşıldığından "
-                "emin ol."
-            )
 
-        output_path = os.path.join(work_dir, f"{file_id}.pptx")
-        with open(output_path, "wb") as fh:
-            fh.write(resp.content)
-        return output_path
+        if is_valid_pptx:
+            output_path = os.path.join(work_dir, f"{file_id}.pptx")
+            with open(output_path, "wb") as fh:
+                fh.write(resp.content)
+            return output_path
+
+        # 2. Deneme: Dosya aslında zaten native olmayan (Drive'a yüklenmiş
+        #    gerçek bir .pptx dosyası, sadece Slides önizlemesinde açılan)
+        #    bir dosya olabilir — bu durumda "export" değil, dosyanın
+        #    kendisini doğrudan indirmek gerekir.
+        try:
+            direct_url = f"https://drive.google.com/uc?id={file_id}"
+            output_path = gdown.download(
+                url=direct_url,
+                output=work_dir + os.sep,
+                quiet=True,
+            )
+            if output_path and os.path.exists(output_path):
+                return output_path
+        except Exception:  # noqa: BLE001
+            logger.exception("Doğrudan indirme denemesi de başarısız oldu")
+
+        raise RuntimeError(
+            "Google Slides / Drive dosyası indirilemedi.\n"
+            f"(Export denemesi -> durum kodu: {resp.status_code}, "
+            f"içerik türü: {content_type or 'belirtilmemiş'})\n\n"
+            "Dosyanın 'Bağlantıya sahip olan herkes görüntüleyebilir' "
+            "şeklinde paylaşıldığından emin ol. Eğer paylaşım ayarı "
+            "doğruysa, dosya boyutu/karmaşıklığı Google'ın dışa aktarma "
+            "sınırını aşıyor olabilir."
+        )
 
     # Normal Drive dosya linki (.../file/d/ID/view gibi)
     output_path = gdown.download(
@@ -940,3 +962,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
