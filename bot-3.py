@@ -552,4 +552,3 @@ def fix_autofit_shrink(input_path: str, output_path: str) -> bool:
             changed = True
 
     if
-
