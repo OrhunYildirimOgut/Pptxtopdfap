@@ -127,13 +127,13 @@ logger = logging.getLogger("pptx2pdf_bot")
 # --------------------------------------------------------------------------- #
 # Amaç: Sadece bilinen tek bir fontu değil, ileride gelecek herhangi bir
 # sunumdaki eksik fontu da mümkün olduğunca otomatik çözmek. Akış:
-#   1) Dosyada kullanılan tüm font isimleri (tema + çalıştırma/run seviyesi
-#      + tablo hücreleri) çıkarılır.
+#   1) Dosyada kullanılan tüm font isimleri (slaytlar + düzenler + asıl
+#      slaytlar + tema + madde imleri) çıkarılır.
 #   2) Sistemde zaten kurulu olanlar atlanır.
-#   3) Bilinen bir açık kaynak karşılığı varsa (FONT_ALIASES) o zaten
-#      build sırasında kurulu olduğu için ekstra işlem gerekmez.
+#   3) Lisanslı bir Office fontuysa (FONT_ALIASES) ölçülmüş özgür karşılığı
+#      kurulur ve fontconfig'e "bunun yerine onu ver" eşleştirmesi yazılır.
 #   4) Kalanlar için Google Fonts'un herkese açık CSS API'si üzerinden
-#      aynı isimde bir font aranır ve varsa indirilip sisteme kurulur.
+#      aynı isimde bir font aranır ve varsa dört stiliyle indirilip kurulur.
 #      Bu, GitHub deposundaki dosya adlandırma biçimini (bazı fontlar artık
 #      "variable font" tek dosya olarak dağıtıldığı için) tahmin etmeye
 #      çalışmaktan çok daha güvenilirdir.
@@ -142,20 +142,71 @@ logger = logging.getLogger("pptx2pdf_bot")
 # bu durumda kesin bir garanti verilemez.
 
 FONT_ALIASES = {
-    # Yaygın Microsoft fontları için, Google Fonts'ta bulunmayan ama
-    # açık kaynaklı karşılığı build sırasında zaten kurulmuş olanlar.
-    # (Karşılıklar Dockerfile'da fontconfig ile eşleştirilir.)
-    "tw cen mt": "Poppins",
-    "calibri": "Carlito",
+    # Microsoft/Office'e ait, lisanslı olduğu için sunucuya kurulamayan ve
+    # Google Fonts'ta da bulunmayan fontlar -> yerine kullanılacak özgür font.
+    #
+    # Karşılıklar GÖRÜNÜŞE göre değil ÖLÇÜME göre seçildi: gerçek fontun ve
+    # adayların harf genişlikleri (Türkçe + İngilizce örnek metin üzerinde)
+    # karşılaştırıldı. Satırın nereden kırılacağını harf genişliği belirler;
+    # genişliği tutmayan bir ikame metni taşırır/kaydırır. Yanlarındaki
+    # yüzdeler ortalama genişlik farkıdır (Calibri -> Carlito ölçümü %0,0
+    # çıkarak yöntemi doğruladı; eski "Tw Cen MT -> Poppins" ise +%22 idi).
+    #
+    # Eşleştirme fontconfig'e _write_fontconfig_aliases() ile yazılır; hedef
+    # font kurulu değilse Google Fonts'tan indirilir.
+    "aptos": "Barlow",                              # -0,6
+    "aptos light": "Barlow",
+    "aptos semibold": "Barlow",
+    "aptos extrabold": "Barlow",
+    "aptos black": "Barlow",
+    "aptos display": "Sofia Sans Semi Condensed",   # +0,6
+    "aptos narrow": "Sofia Sans Semi Condensed",    # -1,0
+    "calibri": "Carlito",                           #  0,0 (birebir)
+    "calibri light": "Carlito",                     # +1,2
     "cambria": "Caladea",
+    "cambria math": "Caladea",
+    "tw cen mt": "Carlito",                         # +1,2
+    "tw cen mt condensed": "Yanone Kaffeesatz",     # +1,8
+    "century gothic": "Inter",                      # +0,1
+    "gill sans mt": "Carlito",                      # -1,2
+    "gill sans": "Carlito",
+    "franklin gothic book": "Gudea",                #  0,0
+    "franklin gothic medium": "Quattrocento Sans",  # +0,2
+    "garamond": "Crimson Text",                     # +0,1
+    "bahnschrift": "Fira Sans",                     # +0,5
+    "segoe ui": "Asap",                             #  0,0
+    "segoe ui light": "Asap",
+    "segoe ui semibold": "Asap",
+    "tahoma": "Figtree",                            # +0,1
+    "candara": "Source Sans 3",                     # -0,7
+    "corbel": "Assistant",                          # -0,2
+    "constantia": "Vollkorn",                       # +0,7
+    "consolas": "Anonymous Pro",                    # -0,7
+    "rockwell": "Bitter",                           # +0,4
+    "bookman old style": "Domine",                  # -2,7
+    "book antiqua": "Gelasio",                      # -0,5
+    "palatino linotype": "Gelasio",                 # -0,5
+    "century schoolbook": "Libre Caslon Text",      # +1,4
+    "arial narrow": "Archivo Narrow",               # +0,4
 }
 
 DYNAMIC_FONT_DIR = "/usr/share/fonts/truetype/dynamic"
-_GOOGLE_FONTS_CSS_URL = "https://fonts.googleapis.com/css2?family={family}"
-# Eski bir tarayıcı User-Agent'ı göndermek, Google'ın woff2 yerine
-# doğrudan .ttf font dosyası linki döndürmesini sağlar (LibreOffice/
-# fontconfig woff2'yi güvenilir şekilde desteklemez).
-_OLD_BROWSER_UA = "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)"
+_GOOGLE_FONTS_CSS_URL = "https://fonts.googleapis.com/css2"
+# Normal + kalın + italik + kalın italik birlikte istenir. Yalnızca normal
+# kalınlık indirilirse LibreOffice kalın/italik metni YAPAY olarak üretir;
+# yapay kalının genişlikleri gerçeğinden farklıdır ve satırlar başka yerden
+# kırılır. Bir ailede istenen stil yoksa Google 400 döner, o yüzden sırayla
+# daha az stil isteyen sorgulara düşülür.
+_GOOGLE_FONTS_STYLE_LADDER = (
+    ":ital,wght@0,400;0,700;1,400;1,700",
+    ":wght@400;700",
+    "",
+)
+# DİKKAT: buraya tarayıcı taklidi yapan bir User-Agent KOYMA. Eski bir
+# tarayıcı kimliğiyle sorulduğunda Google artık .ttf değil EOT döndürüyor
+# (fontconfig okuyamaz); kimliksiz sorguda dört stil de TrueType gelir.
+_FONT_FILE_MAGICS = (b"\x00\x01\x00\x00", b"OTTO", b"true")
+_FONTCONFIG_ALIAS_FILENAME = "35-pptx2pdf-aliases.conf"
 
 _dynamic_font_attempted = set()   # bu süreç ömrü boyunca denenen fontlar
 _dynamic_font_lock = threading.Lock()
@@ -178,47 +229,41 @@ def _iter_text_frames(shapes):
             yield shape.text_frame
 
 
-def _extract_theme_fonts(pptx_path: str) -> set:
-    """Pptx içindeki tema dosyalarından (theme1.xml, theme2.xml, ...)
-    ana/gövde font isimlerini çıkarır."""
-    fonts = set()
-    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
-    try:
-        with zipfile.ZipFile(pptx_path) as z:
-            theme_files = [
-                n for n in z.namelist()
-                if re.match(r"ppt/theme/theme\d+\.xml$", n)
-            ]
-            for tf in theme_files:
-                root = etree.fromstring(z.read(tf))
-                for tag in ("majorFont", "minorFont"):
-                    el = root.find(f".//a:fontScheme/a:{tag}/a:latin", ns)
-                    if el is not None:
-                        typeface = el.get("typeface")
-                        if typeface and not typeface.startswith("+"):
-                            fonts.add(typeface)
-    except Exception:  # noqa: BLE001
-        logger.exception("Tema fontları okunurken hata oluştu")
-    return fonts
+_FONT_TAG_PATTERN = re.compile(
+    rb"<(?:\w+:)?(?:latin|ea|cs|sym|buFont)\b[^>]*?\btypeface=\"([^\"]+)\""
+)
+_FONT_XML_PARTS = re.compile(
+    r"ppt/(?:slides|slideLayouts|slideMasters|theme|notesMasters)/[^/]+\.xml$"
+)
 
 
 def extract_fonts_used(pptx_path: str) -> set:
-    """Bir pptx dosyasında (tema dahil) kullanılan tüm font isimlerini döner."""
+    """
+    Bir pptx dosyasında kullanılan tüm font isimlerini döner.
+
+    Dosya python-pptx ile AÇILMAZ (o, dosyanın tamamını belleğe alır);
+    yalnızca slayt / düzen / asıl slayt / tema XML'leri zip'ten okunup
+    taranır. Eskiden yalnızca slaytlardaki metin parçalarına bakılıyordu;
+    oysa başlık ve gövde metinlerinin fontu çoğu zaman slaytta değil ASIL
+    SLAYTTA (slideMaster) ve düzenlerde tanımlıdır, madde imlerinin fontu
+    (buFont) da ayrıdır — bunlar gözden kaçıyordu.
+
+    Temadaki dile özel uzun liste (<a:font script="Jpan" .../> vb.)
+    bilerek alınmaz: onlarca Uzak Doğu fontunu tek tek aramaya yol açar.
+    """
     fonts = set()
     try:
-        prs = Presentation(pptx_path)
-        for slide in prs.slides:
-            for text_frame in _iter_text_frames(slide.shapes):
-                for paragraph in text_frame.paragraphs:
-                    for run in paragraph.runs:
-                        name = run.font.name
-                        if name and not name.startswith("+"):
-                            fonts.add(name)
+        with zipfile.ZipFile(pptx_path) as z:
+            for name in z.namelist():
+                if not _FONT_XML_PARTS.match(name):
+                    continue
+                for raw in _FONT_TAG_PATTERN.findall(z.read(name)):
+                    typeface = raw.decode("utf-8", "replace").strip()
+                    if typeface and not typeface.startswith("+"):
+                        fonts.add(typeface)
     except Exception:  # noqa: BLE001
         logger.exception("Font taraması sırasında hata oluştu")
-
-    fonts |= _extract_theme_fonts(pptx_path)
-    return {f.strip() for f in fonts if f and f.strip()}
+    return fonts
 
 
 def _get_installed_font_families() -> set:
@@ -243,47 +288,117 @@ def _get_installed_font_families() -> set:
 
 def _download_google_font(family_name: str) -> bool:
     """
-    Google Fonts'un herkese açık CSS API'sinden verilen isimde bir font
-    aramayı ve indirmeyi dener. Bulunup indirilirse True döner.
+    Google Fonts'un herkese açık CSS API'sinden verilen isimde bir fontu
+    arar ve bulduğu bütün stilleri (normal / kalın / italik / kalın italik)
+    indirir. En az bir stil indirildiyse True döner.
     """
+    family_name = family_name.strip()
     try:
-        family_param = requests.utils.quote(family_name.strip())
-        url = _GOOGLE_FONTS_CSS_URL.format(family=family_param)
-        css_resp = requests.get(
-            url, headers={"User-Agent": _OLD_BROWSER_UA}, timeout=8
-        )
-        if css_resp.status_code != 200:
-            return False
-
-        match = re.search(
-            r"url\((https://fonts\.gstatic\.com/[^)]+?\.ttf)\)", css_resp.text
-        )
-        if not match:
-            return False
-
-        font_resp = requests.get(match.group(1), timeout=15)
-        if font_resp.status_code != 200 or len(font_resp.content) < 1000:
+        css_text = None
+        for style_query in _GOOGLE_FONTS_STYLE_LADDER:
+            css_resp = requests.get(
+                _GOOGLE_FONTS_CSS_URL,
+                params={"family": family_name + style_query},
+                timeout=8,
+            )
+            if css_resp.status_code == 200 and "@font-face" in css_resp.text:
+                css_text = css_resp.text
+                break
+        if css_text is None:
             return False
 
         os.makedirs(DYNAMIC_FONT_DIR, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9]", "", family_name)
-        out_path = os.path.join(DYNAMIC_FONT_DIR, f"{safe_name}-Regular.ttf")
-        with open(out_path, "wb") as fh:
-            fh.write(font_resp.content)
-        return True
+        saved = 0
+
+        for block in re.findall(r"@font-face\s*{[^}]*}", css_text):
+            url_match = re.search(r"url\((https://fonts\.gstatic\.com/[^)]+)\)", block)
+            if not url_match:
+                continue
+            weight_match = re.search(r"font-weight:\s*(\d+)", block)
+            weight = weight_match.group(1) if weight_match else "400"
+            italic = "Italic" if re.search(r"font-style:\s*italic", block) else ""
+
+            font_resp = requests.get(url_match.group(1), timeout=20)
+            data = font_resp.content
+            if (
+                font_resp.status_code != 200
+                or len(data) < 1000
+                or data[:4] not in _FONT_FILE_MAGICS
+            ):
+                # TrueType/OpenType değilse (EOT, woff2...) fontconfig
+                # okuyamaz; kurulmuş gibi görünüp işe yaramayacağına atla.
+                logger.warning(
+                    "'%s' için beklenmeyen font biçimi, atlandı (%r)",
+                    family_name, data[:4],
+                )
+                continue
+
+            out_path = os.path.join(
+                DYNAMIC_FONT_DIR, f"{safe_name}-{weight}{italic}.ttf"
+            )
+            with open(out_path, "wb") as fh:
+                fh.write(data)
+            saved += 1
+
+        return saved > 0
 
     except Exception:  # noqa: BLE001
         logger.exception("Google Fonts'tan '%s' indirilirken hata oluştu", family_name)
         return False
 
 
+def _write_fontconfig_aliases() -> None:
+    """
+    FONT_ALIASES tablosunu fontconfig'e yazar ("X fontu istenirse Y'yi ver").
+    Bu dosya olmadan tablo hiçbir işe yaramaz: LibreOffice bulamadığı font
+    için kendi varsayılanına (çok daha geniş bir fonta) düşer.
+
+    binding="same", fontconfig'in kendi ölçü-uyumlu eşleştirmelerinde
+    (30-metric-aliases.conf) kullandığı bağlamadır; LibreOffice bunu "aynı
+    font" sayıp başka bir ikame aramaz. İçerik değişmediyse dosyaya
+    dokunulmaz.
+    """
+    lines = [
+        '<?xml version="1.0"?>',
+        '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">',
+        "<fontconfig>",
+    ]
+    for source, target in sorted(FONT_ALIASES.items()):
+        lines.append(
+            f'  <alias binding="same"><family>{source}</family>'
+            f"<accept><family>{target}</family></accept></alias>"
+        )
+    lines.append("</fontconfig>")
+    content = "\n".join(lines) + "\n"
+
+    user_conf_dir = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "fontconfig", "conf.d",
+    )
+    for conf_dir in ("/etc/fonts/conf.d", user_conf_dir):
+        path = os.path.join(conf_dir, _FONTCONFIG_ALIAS_FILENAME)
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    if fh.read() == content:
+                        return
+            os.makedirs(conf_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            return
+        except OSError:
+            continue  # sistem dizinine yazılamıyorsa kullanıcı dizinini dene
+    logger.warning("Fontconfig eşleştirme dosyası yazılamadı")
+
+
 def ensure_fonts_available(pptx_path: str) -> None:
     """
     Dosyada kullanılan fontlardan sistemde kurulu olmayanları tespit eder
-    ve mümkünse otomatik olarak temin eder (bilinen ikame veya Google
-    Fonts'tan canlı indirme). Bulunamayan fontlar için LibreOffice'in
-    varsayılan ikamesi kullanılmaya devam eder — bu fonksiyon en iyi
-    çabayı gösterir, %100 garanti vermez.
+    ve mümkünse otomatik olarak temin eder: aynı isimle Google Fonts'ta
+    varsa onu, yoksa FONT_ALIASES'taki ölçülmüş karşılığını indirir.
+    Hiçbiri yoksa LibreOffice'in varsayılan ikamesi kullanılır — bu
+    fonksiyon en iyi çabayı gösterir, %100 garanti vermez.
     """
     used_fonts = extract_fonts_used(pptx_path)
     if not used_fonts:
@@ -293,23 +408,33 @@ def ensure_fonts_available(pptx_path: str) -> None:
     downloaded_any = False
 
     with _dynamic_font_lock:
+        _write_fontconfig_aliases()
+
         for font_name in used_fonts:
             key = font_name.lower()
-
             if key in installed:
                 continue
-            if key in FONT_ALIASES:
-                # Build sırasında zaten kurulu bilinen bir ikamesi var
-                # (Dockerfile'daki fontconfig eşleştirmesi devreye girer).
-                continue
-            if key in _dynamic_font_attempted:
+
+            # Lisanslı Office fontu: adıyla aramak boşuna, karşılığını kur.
+            wanted = FONT_ALIASES.get(key, font_name)
+            wanted_key = wanted.lower()
+            if wanted_key in installed or wanted_key in _dynamic_font_attempted:
                 continue
 
-            _dynamic_font_attempted.add(key)  # tekrar denemeyi engelle
+            _dynamic_font_attempted.add(wanted_key)  # tekrar denemeyi engelle
 
-            if _download_google_font(font_name):
-                logger.info("Font otomatik indirildi: %s", font_name)
+            if _download_google_font(wanted):
+                installed.add(wanted_key)
                 downloaded_any = True
+                if wanted == font_name:
+                    logger.info("Font otomatik indirildi: %s", font_name)
+                else:
+                    logger.info("Font karşılığı indirildi: %s -> %s", font_name, wanted)
+            else:
+                logger.warning(
+                    "Font bulunamadı, LibreOffice varsayılanı kullanılacak: %s",
+                    font_name,
+                )
 
     if downloaded_any:
         try:
@@ -723,15 +848,15 @@ def convert_pptx_to_pdf_chunked(
                     "Parça %d sıkıştırması başarısız, orijinal parça kullanılacak", i
                 )
 
-        # Font tarama + autofit düzeltmesi: tüm dosyada pahalı, ama küçük
-        # bir parça üzerinde ucuz — büyük dosyalarda da metin taşmasın.
+        # Autofit düzeltmesi: tüm dosyada pahalı, ama küçük bir parça
+        # üzerinde ucuz — büyük dosyalarda da metin taşmasın. (Fontlar
+        # parçalamadan önce, dosyanın tamamı için bir kez hazırlanır.)
         try:
-            ensure_fonts_available(convert_source)
             fixed_chunk_path = os.path.join(chunk_out_dir, "fixed.pptx")
             if fix_autofit_shrink(convert_source, fixed_chunk_path):
                 convert_source = fixed_chunk_path
         except Exception:  # noqa: BLE001
-            logger.exception("Parça %d font/autofit hazırlığı başarısız", i)
+            logger.exception("Parça %d autofit düzeltmesi başarısız", i)
 
         pdf_path = convert_pptx_to_pdf(convert_source, chunk_out_dir)
 
@@ -1105,6 +1230,16 @@ async def convert_and_reply(
             except Exception:  # noqa: BLE001
                 logger.exception("Slayt sayısı okunamadı")
 
+        # Fontlar: parçalansın ya da parçalanmasın, dosyanın TAMAMI için bir
+        # kez hazırlanır. Tarama yalnızca zip içindeki XML'leri okur, büyük
+        # dosyada da ucuzdur. Eksik font = farklı harf genişliği = metnin
+        # ve çevresindeki görsellerin kayması.
+        if is_pptx_like:
+            try:
+                await loop.run_in_executor(None, ensure_fonts_available, input_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("Font hazırlığı sırasında hata oluştu, devam ediliyor")
+
         will_chunk = is_pptx_like and (
             slide_count > CHUNK_SLIDE_THRESHOLD
             or raw_size_mb > CHUNK_FILE_SIZE_MB_THRESHOLD
@@ -1168,16 +1303,7 @@ async def convert_and_reply(
                         "Görsel sıkıştırma başarısız, orijinal dosyayla devam ediliyor"
                     )
 
-            # 2) Font tarama.
-            if is_pptx_like:
-                try:
-                    await loop.run_in_executor(
-                        None, ensure_fonts_available, convert_input_path
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception("Font hazırlığı sırasında hata oluştu, devam ediliyor")
-
-            # 3) Autofit düzeltmesi.
+            # 2) Autofit düzeltmesi.
             fixed_path = os.path.join(work_dir, "fixed_" + file_name)
             try:
                 was_fixed = await loop.run_in_executor(
