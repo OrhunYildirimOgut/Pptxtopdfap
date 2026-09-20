@@ -39,6 +39,7 @@ import gdown
 import requests
 from lxml import etree
 from PIL import Image as PILImage
+from PIL import ImageOps
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
@@ -404,6 +405,172 @@ def convert_pptx_to_pdf(input_path: str, output_dir: str) -> str:
 # Büyük dosyalar için: parçalama, ayrı ayrı dönüştürme, birleştirme
 # --------------------------------------------------------------------------- #
 
+_SHRINK_IMAGE_EXTS = (
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp",
+)
+# PDF statik bir format: gömülü video/ses hiçbir şekilde PDF'e girmez, ama
+# büyük sunumların boyutunun çoğu genelde bunlardır. Parçayı paketten
+# SİLMEK ilişkileri (rels) bozar; bunun yerine içeriğini boşaltıyoruz —
+# slayttaki kapak görseli (poster frame) ayrı bir görsel olduğu için
+# PDF'te aynen görünmeye devam eder.
+_SHRINK_MEDIA_EXTS = (
+    ".mp4", ".m4v", ".mov", ".avi", ".wmv", ".mpg", ".mpeg", ".mkv", ".webm",
+    ".mp3", ".wav", ".m4a", ".wma", ".aac", ".ogg",
+)
+_SHRINK_MIN_IMAGE_BYTES = 150 * 1024  # bundan küçük görselle uğraşmaya değmez
+
+
+def _recompress_image_blob(blob: bytes, max_dimension: int, jpeg_quality: int):
+    """
+    Tek bir görselin baytlarını küçültüp yeniden sıkıştırır. Daha küçük bir
+    sonuç elde edilemezse (veya görsel açılamazsa) None döner.
+
+    Saydamlığı olan görseller (logo, kesilmiş figür vb.) JPEG'e çevrilirse
+    arka planları SİYAH olur; bunlar PNG olarak kalır, sadece küçültülür.
+    """
+    try:
+        pil_img = PILImage.open(io.BytesIO(blob))
+        orig_format = pil_img.format
+        orig_w, orig_h = pil_img.size
+    except Exception:  # noqa: BLE001
+        return None
+
+    if orig_format not in ("JPEG", "PNG", "BMP", "TIFF", "GIF", "WEBP"):
+        return None
+
+    # JPEG "draft" modu: 40-50MP'lik bir fotoğrafı tam çözünürlükte decode
+    # etmeden, baştan küçük boyutta açar — tepe belleği ciddi düşürür.
+    if orig_format == "JPEG" and max(orig_w, orig_h) > max_dimension:
+        try:
+            pil_img.draft("RGB", (max_dimension, max_dimension))
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        pil_img.load()
+        # LibreOffice JPEG'i EXIF yönüne göre döndürerek açar; yeniden
+        # kaydederken EXIF kaybolduğu için dönüşü piksellere işliyoruz ki
+        # görsel PDF'te yan yatmasın.
+        pil_img = ImageOps.exif_transpose(pil_img)
+    except Exception:  # noqa: BLE001
+        return None
+
+    has_alpha = pil_img.mode in ("RGBA", "LA") or (
+        pil_img.mode == "P" and "transparency" in pil_img.info
+    )
+
+    w, h = pil_img.size
+    if max(w, h) > max_dimension:
+        scale = max_dimension / max(w, h)
+        if has_alpha and pil_img.mode != "RGBA":
+            pil_img = pil_img.convert("RGBA")
+        elif not has_alpha and pil_img.mode not in ("RGB", "L"):
+            pil_img = pil_img.convert("RGB")
+        pil_img = pil_img.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            PILImage.LANCZOS,
+        )
+
+    buf = io.BytesIO()
+    try:
+        if has_alpha:
+            pil_img.save(buf, format="PNG", optimize=True)
+        else:
+            if pil_img.mode not in ("RGB", "L"):
+                pil_img = pil_img.convert("RGB")
+            pil_img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+    new_blob = buf.getvalue()
+    return new_blob if len(new_blob) < len(blob) else None
+
+
+def shrink_pptx_streaming(
+    input_path: str,
+    output_path: str,
+    max_dimension: int = IMAGE_MAX_DIMENSION_PX,
+    jpeg_quality: int = IMAGE_JPEG_QUALITY,
+    progress_callback=None,
+) -> tuple:
+    """
+    Büyük bir pptx'i, python-pptx ile AÇMADAN (yani dosyanın tamamını
+    belleğe almadan) küçültür. pptx bir zip'tir: girdiler tek tek okunur,
+    ppt/media altındaki görseller birer birer yeniden sıkıştırılır,
+    video/ses içerikleri boşaltılır, geri kalan her şey olduğu gibi akış
+    hâlinde kopyalanır. Tepe bellek ≈ o an işlenen TEK görsel; dosyanın
+    500MB olması belleği etkilemez.
+
+    Görselin biçimi değişse de (PNG -> JPEG) zip içindeki adı aynı kalır;
+    LibreOffice görsel türünü uzantıdan değil içerikten tanır
+    (compress_pptx_images de aynı varsayıma dayanıyor).
+
+    Dönüş: (sıkıştırılan_görsel_sayısı, boşaltılan_medya_sayısı).
+    """
+    compressed_count = 0
+    blanked_count = 0
+
+    with zipfile.ZipFile(input_path) as zin:
+        infos = zin.infolist()
+        media_total = sum(
+            1 for i in infos if i.filename.lower().startswith("ppt/media/")
+        )
+        media_done = 0
+
+        with zipfile.ZipFile(output_path, "w", allowZip64=True) as zout:
+            for info in infos:
+                name_lower = info.filename.lower()
+                ext = os.path.splitext(name_lower)[1]
+                is_media = name_lower.startswith("ppt/media/")
+
+                if is_media and ext in _SHRINK_MEDIA_EXTS:
+                    zout.writestr(info.filename, b"", zipfile.ZIP_STORED)
+                    blanked_count += 1
+                elif (
+                    is_media
+                    and ext in _SHRINK_IMAGE_EXTS
+                    and info.file_size >= _SHRINK_MIN_IMAGE_BYTES
+                ):
+                    blob = zin.read(info)
+                    new_blob = _recompress_image_blob(
+                        blob, max_dimension, jpeg_quality
+                    )
+                    if new_blob is not None:
+                        compressed_count += 1
+                        blob = new_blob
+                    # Görseller zaten sıkıştırılmış veri; tekrar deflate
+                    # etmek sadece CPU harcar.
+                    zout.writestr(info.filename, blob, zipfile.ZIP_STORED)
+                    del blob, new_blob
+                    gc.collect()
+                else:
+                    compress_type = (
+                        zipfile.ZIP_STORED if is_media else zipfile.ZIP_DEFLATED
+                    )
+                    out_info = zipfile.ZipInfo(info.filename, info.date_time)
+                    out_info.compress_type = compress_type
+                    with zin.open(info) as src, zout.open(out_info, "w") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+
+                if is_media:
+                    media_done += 1
+                    if progress_callback is not None and (
+                        media_done % 10 == 0 or media_done == media_total
+                    ):
+                        progress_callback(media_done, media_total)
+
+    return compressed_count, blanked_count
+
+
+def count_slides_fast(pptx_path: str) -> int:
+    """Slayt sayısını, dosyanın tamamını belleğe yüklemeden (yalnızca
+    ppt/presentation.xml'i okuyarak) döndürür."""
+    with zipfile.ZipFile(pptx_path) as z:
+        root = etree.fromstring(z.read("ppt/presentation.xml"))
+    sld_id_lst = root.find(qn("p:sldIdLst"))
+    return 0 if sld_id_lst is None else len(sld_id_lst)
+
+
 def _keep_only_slides(prs: Presentation, keep_indices: set) -> None:
     """
     Verilen Presentation nesnesinde SADECE keep_indices'teki (0-tabanlı)
@@ -430,36 +597,21 @@ def _keep_only_slides(prs: Presentation, keep_indices: set) -> None:
                     pass
 
 
-def split_pptx_into_chunks(input_path: str, work_dir: str, chunk_size: int) -> list:
+def write_pptx_chunk(
+    input_path: str, chunk_path: str, start: int, end: int
+) -> None:
     """
-    Bir pptx dosyasını, her biri en fazla chunk_size slayt içeren ayrı
-    pptx dosyalarına böler. Bölmeye gerek yoksa (slayt sayısı zaten
-    küçükse) tek elemanlı [input_path] listesi döner.
+    input_path'teki sunumun [start, end) aralığındaki slaytlarını ayrı bir
+    pptx olarak chunk_path'e yazar.
+
+    Parçalar TEK TEK üretilir (hepsi baştan değil): aynı anda bellekte
+    yalnızca bir Presentation, diskte yalnızca bir parça bulunur.
     """
-    prs_full = Presentation(input_path)
-    total = len(prs_full.slides)
-
-    if total <= chunk_size:
-        return [input_path]
-
-    chunk_paths = []
-    num_chunks = math.ceil(total / chunk_size)
-
-    for c in range(num_chunks):
-        start = c * chunk_size
-        end = min(start + chunk_size, total)
-        keep = set(range(start, end))
-
-        # Her parça için orijinal dosyanın taze bir kopyasını aç, böylece
-        # önceki parçalarda yapılan silmeler birbirini etkilemez.
-        prs_chunk = Presentation(input_path)
-        _keep_only_slides(prs_chunk, keep)
-
-        chunk_path = os.path.join(work_dir, f"chunk_{c:03d}.pptx")
-        prs_chunk.save(chunk_path)
-        chunk_paths.append(chunk_path)
-
-    return chunk_paths
+    prs_chunk = Presentation(input_path)
+    _keep_only_slides(prs_chunk, set(range(start, end)))
+    prs_chunk.save(chunk_path)
+    del prs_chunk
+    gc.collect()
 
 
 def split_pdf_by_size(
@@ -516,48 +668,87 @@ def convert_pptx_to_pdf_chunked(
     work_dir: str,
     chunk_size: int = CHUNK_SIZE,
     progress_callback=None,
+    already_shrunk: bool = False,
 ) -> str:
     """
     Büyük/ağır bir sunumu slayt gruplarına böler, her grubu ayrı ayrı
     PDF'e çevirir ve sonunda hepsini tek bir PDF'te birleştirir.
 
+    Her parça sırayla üretilir -> dönüştürülür -> ara dosyaları silinir;
+    diskte hiçbir an tek parçadan fazlası (ve biriken küçük PDF'ler
+    dışında bir şey) durmaz.
+
     progress_callback(done, total) verilirse her parça tamamlandığında
     çağrılır (ilerleme durumu göstermek için).
-    """
-    chunk_paths = split_pptx_into_chunks(input_path, work_dir, chunk_size)
 
-    if len(chunk_paths) == 1:
-        # Bölmeye gerek yoktu, normal (bölünmemiş) yoldan devam et.
-        return convert_pptx_to_pdf(chunk_paths[0], work_dir)
+    already_shrunk=True ise görseller shrink_pptx_streaming ile zaten
+    küçültülmüştür; parça başına ikinci bir sıkıştırma yapılmaz.
+    """
+    total = count_slides_fast(input_path)
+
+    if total <= chunk_size:
+        # Bölmeye gerek yok, normal (bölünmemiş) yoldan devam et.
+        return convert_pptx_to_pdf(input_path, work_dir)
 
     pdf_chunk_paths = []
-    total_chunks = len(chunk_paths)
+    total_chunks = math.ceil(total / chunk_size)
 
-    for i, chunk_path in enumerate(chunk_paths):
+    for i in range(total_chunks):
         chunk_out_dir = os.path.join(work_dir, f"chunk_out_{i:03d}")
         os.makedirs(chunk_out_dir, exist_ok=True)
+
+        chunk_path = os.path.join(chunk_out_dir, f"chunk_{i:03d}.pptx")
+        write_pptx_chunk(
+            input_path, chunk_path, i * chunk_size, min((i + 1) * chunk_size, total)
+        )
 
         # Her parçayı LibreOffice'e vermeden önce, SADECE O PARÇAYI
         # (tüm dosyayı değil) sıkıştır. Bu, bellek yükünü çok düşük
         # tutar — aynı anda hafızada sadece birkaç slaytlık görsel
         # bulunur, devasa dosyanın tamamı değil.
         convert_source = chunk_path
+        if not already_shrunk:
+            try:
+                compressed_chunk_path = os.path.join(chunk_out_dir, "compressed.pptx")
+                count, _saved = compress_pptx_images(
+                    chunk_path,
+                    compressed_chunk_path,
+                    max_dimension=IMAGE_MAX_DIMENSION_PX,
+                    jpeg_quality=IMAGE_JPEG_QUALITY,
+                )
+                if count > 0 and os.path.exists(compressed_chunk_path):
+                    convert_source = compressed_chunk_path
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Parça %d sıkıştırması başarısız, orijinal parça kullanılacak", i
+                )
+
+        # Font tarama + autofit düzeltmesi: tüm dosyada pahalı, ama küçük
+        # bir parça üzerinde ucuz — büyük dosyalarda da metin taşmasın.
         try:
-            compressed_chunk_path = os.path.join(chunk_out_dir, "compressed.pptx")
-            count, _saved = compress_pptx_images(
-                chunk_path,
-                compressed_chunk_path,
-                max_dimension=IMAGE_MAX_DIMENSION_PX,
-                jpeg_quality=IMAGE_JPEG_QUALITY,
-            )
-            if count > 0 and os.path.exists(compressed_chunk_path):
-                convert_source = compressed_chunk_path
+            ensure_fonts_available(convert_source)
+            fixed_chunk_path = os.path.join(chunk_out_dir, "fixed.pptx")
+            if fix_autofit_shrink(convert_source, fixed_chunk_path):
+                convert_source = fixed_chunk_path
         except Exception:  # noqa: BLE001
-            logger.exception(
-                "Parça %d sıkıştırması başarısız, orijinal parça kullanılacak", i
-            )
+            logger.exception("Parça %d font/autofit hazırlığı başarısız", i)
 
         pdf_path = convert_pptx_to_pdf(convert_source, chunk_out_dir)
+
+        # Parçanın PDF'i dışındaki her şeyi (parça pptx'leri, LibreOffice
+        # profili) hemen sil; disk kullanımı parça sayısıyla büyümesin.
+        for entry in os.listdir(chunk_out_dir):
+            entry_path = os.path.join(chunk_out_dir, entry)
+            if entry_path == pdf_path:
+                continue
+            if os.path.isdir(entry_path):
+                shutil.rmtree(entry_path, ignore_errors=True)
+            else:
+                try:
+                    os.remove(entry_path)
+                except OSError:
+                    pass
+
         pdf_chunk_paths.append(pdf_path)
 
         if progress_callback is not None:
@@ -847,6 +1038,59 @@ async def convert_and_reply(
         is_pptx_like = ext in (".pptx", ".pptm", ".potx")
 
         raw_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        already_shrunk = False
+
+        # 0) Büyük dosya: python-pptx'e DOKUNMADAN önce zip seviyesinde
+        #    küçült. python-pptx bir dosyayı açarken TAMAMINI belleğe alır;
+        #    500MB'lık bir sunumu (hele her parça için yeniden) açmak
+        #    sunucunun belleğini taşırıyordu. Akış hâlindeki bu ön adım
+        #    aynı anda yalnızca tek bir görseli bellekte tutar ve sonraki
+        #    bütün adımlar küçülmüş dosya üzerinde çalışır.
+        if is_pptx_like and raw_size_mb > IMAGE_COMPRESS_THRESHOLD_MB:
+            await status_msg.edit_text(
+                f"🗜️ Dosya {raw_size_mb:.0f} MB, görseller tek tek "
+                "küçültülüyor... (birkaç dakika sürebilir)"
+            )
+            passes = (
+                (IMAGE_MAX_DIMENSION_PX, IMAGE_JPEG_QUALITY),
+                (IMAGE_MAX_DIMENSION_PX_AGGRESSIVE, IMAGE_JPEG_QUALITY_AGGRESSIVE),
+            )
+            for pass_no, (max_dim, quality) in enumerate(passes, start=1):
+                shrunk_path = os.path.join(work_dir, f"shrunk{pass_no}_{file_name}")
+                try:
+                    img_count, media_count = await loop.run_in_executor(
+                        None,
+                        shrink_pptx_streaming,
+                        input_path,
+                        shrunk_path,
+                        max_dim,
+                        quality,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Akış hâlinde küçültme başarısız, mevcut dosyayla devam"
+                    )
+                    try:
+                        os.remove(shrunk_path)
+                    except OSError:
+                        pass
+                    break
+
+                new_size_mb = os.path.getsize(shrunk_path) / (1024 * 1024)
+                logger.info(
+                    "Küçültme turu %d: %d görsel, %d video/ses, %.0fMB -> %.0fMB",
+                    pass_no, img_count, media_count, raw_size_mb, new_size_mb,
+                )
+                # Eski (büyük) dosyayı hemen sil; disk de sınırlı.
+                try:
+                    os.remove(input_path)
+                except OSError:
+                    pass
+                input_path = shrunk_path
+                raw_size_mb = new_size_mb
+                already_shrunk = True
+                if new_size_mb <= IMAGE_SECOND_PASS_THRESHOLD_MB:
+                    break
 
         # Parçalama gerekip gerekmeyeceğine ERKEN karar veriyoruz (tüm
         # dosyayı sıkıştırmadan/font taramadan ÖNCE). Çünkü büyük
@@ -857,7 +1101,7 @@ async def convert_and_reply(
         slide_count = 0
         if is_pptx_like:
             try:
-                slide_count = len(Presentation(input_path).slides)
+                slide_count = count_slides_fast(input_path)
             except Exception:  # noqa: BLE001
                 logger.exception("Slayt sayısı okunamadı")
 
@@ -960,6 +1204,7 @@ async def convert_and_reply(
                 work_dir,
                 effective_chunk_size,
                 progress_cb,
+                already_shrunk,
             )
         else:
             await status_msg.edit_text("🔄 PDF'e dönüştürülüyor... (biraz sürebilir)")
