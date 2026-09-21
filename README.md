@@ -52,6 +52,12 @@ Bot polling modunda çalışır; terminali açık tutman (veya bir sunucuda
 
 ## Notlar / Sınırlamalar
 
+- PowerPoint'in metni kutuya sığdırma ayarları (`fontScale` ve
+  `lnSpcReduction`) korunur ve LibreOffice tarafından uygulanır. Şablondan
+  gelen punto değerlerini elle değiştirmek veya otomatik sığdırmayı
+  kapatmak, metnin büyüyüp görsellerin altına taşmasına neden olabilir.
+  Eksik fontların ikamesi yine de görünüm farkı oluşturabilir; her sunum
+  için PowerPoint ile piksel düzeyinde aynı sonuç garanti edilmez.
 - Varsayılan Telegram Bot API, botların indirebileceği dosya boyutunu
   sınırlar (genelde 20 MB civarı). Daha büyük dosyalar için kendi
   [Local Bot API Server](https://github.com/tdlib/telegram-bot-api)
@@ -64,3 +70,14 @@ Bot polling modunda çalışır; terminali açık tutman (veya bir sunucuda
   yüzden çakışma yaşanmaz.
 - Sunucuda çalıştırırken bot'u arka planda tutmak için örnek bir
   systemd servis dosyası isteyebilirsin.
+
+## Test
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Testler Telegram'a bağlanmaz ve LibreOffice gerektirmez. Küçük dosya,
+slaytlara bölme ve görsel sıkıştırma yollarında metin ayarlarının
+dönüştürücüye değişmeden ulaştığını kontrol eder. Görsel doğrulama için
+aynı sunumu Docker imajındaki LibreOffice ile PDF'e dönüştürüp karşılaştırın.

@@ -43,7 +43,6 @@ from PIL import ImageOps
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
-from pptx.util import Pt
 from pypdf import PdfReader, PdfWriter
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
@@ -79,14 +78,8 @@ CHUNK_SLIDE_THRESHOLD = 40      # bu slayt sayısından fazlaysa böl
 CHUNK_FILE_SIZE_MB_THRESHOLD = 30  # bu boyuttan büyükse de böl (ağır medya)
 CHUNK_SIZE = 15                 # her parçada kaç slayt olacak
 
-# python-pptx ile bir dosyayı açmak (font tarama, autofit düzeltmesi,
-# parçalama) dosyanın TAMAMINI belleğe yükler. Ama artık bu kontrol
-# GÖRSEL SIKIŞTIRMADAN SONRAKİ boyuta bakıyor — ve görsel sıkıştırmanın
-# kendisi (çok daha ağır bir python-pptx işlemi, görselleri gerçekten
-# decode/encode ediyor) 484MB'lık dosyalarda bile başarıyla çalıştığı
-# doğrulandı. Bu yüzden font/autofit gibi çok daha hafif işlemler için
-# eşiği yüksek tutuyoruz; aksi hâlde büyük dosyalarda metin taşması/
-# görsel kayması sorunları geri dönüyordu.
+# Akış hâlinde görsel sıkıştırmadan sonra bile bu boyutu aşan sunumları
+# daha küçük slayt gruplarıyla dönüştürerek bellek yükünü sınırlıyoruz.
 MEMORY_SAFE_PPTX_MB_THRESHOLD = 400
 
 # Otomatik görsel sıkıştırma: dosya bu boyutu aşarsa, PowerPoint'in
@@ -210,23 +203,6 @@ _FONTCONFIG_ALIAS_FILENAME = "35-pptx2pdf-aliases.conf"
 
 _dynamic_font_attempted = set()   # bu süreç ömrü boyunca denenen fontlar
 _dynamic_font_lock = threading.Lock()
-
-
-def _iter_text_frames(shapes):
-    """
-    Bir slayttaki tüm metin çerçevelerini dolaşır: normal metin kutuları,
-    gruplanmış şekillerin içindekiler (iç içe olsa bile) ve tablo
-    hücrelerindeki metinler dahil.
-    """
-    for shape in shapes:
-        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            yield from _iter_text_frames(shape.shapes)
-        elif getattr(shape, "has_table", False):
-            for row in shape.table.rows:
-                for cell in row.cells:
-                    yield cell.text_frame
-        elif getattr(shape, "has_text_frame", False):
-            yield shape.text_frame
 
 
 _FONT_TAG_PATTERN = re.compile(
@@ -466,6 +442,10 @@ def convert_pptx_to_pdf(input_path: str, output_dir: str) -> str:
     LibreOffice'i headless modda çalıştırarak pptx -> pdf dönüştürür.
     Yüksek kaliteli görsel/metin çıktısı için PDF export filtre
     seçenekleri ayarlanır (JPEG sıkıştırması kapalı, çözünürlük yüksek).
+
+    Metin boyutlarına ve normAutofit ayarlarına dokunulmaz. LibreOffice
+    fontScale / lnSpcReduction ile şablondan gelen puntoyu birlikte
+    uygular; bu bilgileri silmek metni büyütüp görsellerin altına taşırır.
     """
     soffice = find_soffice()
 
@@ -848,16 +828,6 @@ def convert_pptx_to_pdf_chunked(
                     "Parça %d sıkıştırması başarısız, orijinal parça kullanılacak", i
                 )
 
-        # Autofit düzeltmesi: tüm dosyada pahalı, ama küçük bir parça
-        # üzerinde ucuz — büyük dosyalarda da metin taşmasın. (Fontlar
-        # parçalamadan önce, dosyanın tamamı için bir kez hazırlanır.)
-        try:
-            fixed_chunk_path = os.path.join(chunk_out_dir, "fixed.pptx")
-            if fix_autofit_shrink(convert_source, fixed_chunk_path):
-                convert_source = fixed_chunk_path
-        except Exception:  # noqa: BLE001
-            logger.exception("Parça %d autofit düzeltmesi başarısız", i)
-
         pdf_path = convert_pptx_to_pdf(convert_source, chunk_out_dir)
 
         # Parçanın PDF'i dışındaki her şeyi (parça pptx'leri, LibreOffice
@@ -882,45 +852,6 @@ def convert_pptx_to_pdf_chunked(
     merged_path = os.path.join(work_dir, "merged.pdf")
     merge_pdfs(pdf_chunk_paths, merged_path)
     return merged_path
-
-
-def _get_autofit_scale(text_frame):
-    """
-    PowerPoint'in bir metin kutusuna uyguladığı "otomatik küçült"
-    (shrink text on overflow) oranını pptx XML'inden okur.
-    Örn. fontScale="92500" -> 0.925 (yani %92.5'e küçültülmüş) döner.
-    Küçültme uygulanmamışsa None döner.
-    """
-    txBody = text_frame._txBody
-    bodyPr = txBody.find(qn("a:bodyPr"))
-    if bodyPr is None:
-        return None
-    norm_autofit = bodyPr.find(qn("a:normAutofit"))
-    if norm_autofit is None:
-        return None
-    font_scale_attr = norm_autofit.get("fontScale")
-    if not font_scale_attr:
-        return None
-    scale = int(font_scale_attr) / 100000.0
-    if scale >= 0.999:
-        return None
-    return scale
-
-
-def _disable_autofit(text_frame):
-    """
-    normAutofit etiketini kaldırıp yerine noAutofit ekler; böylece
-    biz gerçek (küçültülmüş) font boyutunu yazdıktan sonra LibreOffice
-    üzerine bir daha küçültme uygulamaya çalışmaz.
-    """
-    bodyPr = text_frame._txBody.find(qn("a:bodyPr"))
-    if bodyPr is None:
-        return
-    norm_autofit = bodyPr.find(qn("a:normAutofit"))
-    if norm_autofit is not None:
-        bodyPr.remove(norm_autofit)
-    if bodyPr.find(qn("a:noAutofit")) is None:
-        etree.SubElement(bodyPr, qn("a:noAutofit"))
 
 
 def _iter_all_shapes(shapes):
@@ -1042,57 +973,6 @@ def compress_pptx_images(
 
     prs.save(output_path)
     return compressed_count, saved_bytes
-
-
-def fix_autofit_shrink(input_path: str, output_path: str) -> bool:
-    """
-    PowerPoint'in "metni otomatik küçült" özelliğiyle küçülttüğü ama
-    LibreOffice'in PDF'e çevirirken doğru uygulamadığı font boyutlarını,
-    gerçek (küçültülmüş) punto değeri olarak dosyaya yazar.
-
-    Böylece LibreOffice, PowerPoint'te ekranda görünenle aynı boyutta
-    metin render eder ve metnin görsellerin/diğer öğelerin üzerine
-    taşması engellenir.
-
-    Yalnızca OOXML tabanlı formatlar (.pptx, .pptm, .potx) desteklenir;
-    eski ikili .ppt formatı python-pptx tarafından okunamadığından
-    bu durumda dosya olduğu gibi bırakılır (False döner).
-
-    Dönüş: en az bir düzeltme yapıldıysa True, hiçbir şey
-    değiştirilmediyse (veya dosya işlenemediyse) False.
-    """
-    ext = os.path.splitext(input_path)[1].lower()
-    if ext not in (".pptx", ".pptm", ".potx"):
-        return False
-
-    try:
-        prs = Presentation(input_path)
-    except Exception:
-        logger.exception("Autofit düzeltmesi için dosya açılamadı, atlanıyor")
-        return False
-
-    changed = False
-
-    for slide in prs.slides:
-        for text_frame in _iter_text_frames(slide.shapes):
-            scale = _get_autofit_scale(text_frame)
-            if scale is None:
-                continue
-
-            for paragraph in text_frame.paragraphs:
-                if paragraph.font.size is not None:
-                    paragraph.font.size = Pt(paragraph.font.size.pt * scale)
-                for run in paragraph.runs:
-                    if run.font.size is not None:
-                        run.font.size = Pt(run.font.size.pt * scale)
-
-            _disable_autofit(text_frame)
-            changed = True
-
-    if changed:
-        prs.save(output_path)
-
-    return changed
 
 
 # --------------------------------------------------------------------------- #
@@ -1248,19 +1128,15 @@ async def convert_and_reply(
         convert_input_path = input_path
 
         if will_chunk:
-            # Büyük dosya: tüm-dosya sıkıştırma/font/autofit adımlarını
-            # atla — bunlar convert_pptx_to_pdf_chunked içinde HER PARÇA
-            # için ayrı ayrı (çok daha az bellekle) uygulanacak.
+            # Büyük dosya: kalan görsel sıkıştırma işlemi her parça
+            # üzerinde ayrı ayrı (çok daha az bellekle) uygulanacak.
             await status_msg.edit_text(
                 f"🔄 Büyük dosya tespit edildi ({slide_count} slayt, "
                 f"{raw_size_mb:.0f} MB).\nParçalara bölünüp, her parça "
                 "ayrı ayrı sıkıştırılıp dönüştürülecek..."
             )
         else:
-            # Küçük/orta boy dosya: tüm dosya üzerinde sıkıştırma +
-            # font taraması + autofit düzeltmesi güvenle uygulanabilir.
-
-            # 1) Görselleri sıkıştır (dosya yeterince büyükse).
+            # Küçük/orta boy dosya: gerekiyorsa görselleri sıkıştır.
             if raw_size_mb > IMAGE_COMPRESS_THRESHOLD_MB and is_pptx_like:
                 await status_msg.edit_text(
                     f"🗜️ Dosya {raw_size_mb:.0f}MB, görseller sıkıştırılıyor..."
@@ -1302,17 +1178,6 @@ async def convert_and_reply(
                     logger.exception(
                         "Görsel sıkıştırma başarısız, orijinal dosyayla devam ediliyor"
                     )
-
-            # 2) Autofit düzeltmesi.
-            fixed_path = os.path.join(work_dir, "fixed_" + file_name)
-            try:
-                was_fixed = await loop.run_in_executor(
-                    None, fix_autofit_shrink, convert_input_path, fixed_path
-                )
-                if was_fixed:
-                    convert_input_path = fixed_path
-            except Exception:  # noqa: BLE001
-                logger.exception("Autofit düzeltmesi başarısız, orijinal dosya kullanılacak")
 
         # Çok büyük dosyalarda LibreOffice'in her seferinde işlediği yükü
         # daha da azaltmak için daha küçük parçalar kullan.
